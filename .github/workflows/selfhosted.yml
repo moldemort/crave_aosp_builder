@@ -5,7 +5,7 @@
 # SPDX-License-Identifier: Apache-2.0
 #
 
-name: Crave Builder(self-hosted)
+name: Crave Builder
 on:
   workflow_dispatch:
     # Various inputs to simplify usage of workflow.
@@ -352,25 +352,57 @@ jobs:
         echo "LUNCH=$LUNCH" >> "$GITHUB_ENV"
         echo "LOCAL_MANIFEST=$LOCAL_MANIFEST" >> "$GITHUB_ENV"
 
+      # Record build start time for duration calculation later
+    - name: Record Build Start Time
+      run: |
+        echo "BUILD_START_EPOCH=$(date +%s)" >> "$GITHUB_ENV"
+        echo "BUILD_START_FORMATTED=$(date -u '+%Y-%m-%d %H:%M:%S UTC')" >> "$GITHUB_ENV"
+
       # Send Build 'start' notification
     - name: Telegram Notification
       continue-on-error: true
       run: |
-        send_telegram_message() {
-          local message="$1"
-          curl -s -X POST \
-          https://api.telegram.org/bot$botToken/sendMessage \
-          -d chat_id=$chatId \
-          -d text="$message" \
-          -d parse_mode="Markdown"
-        }
-        
-        send_telegram_message "Crave Project: ${{ github.event.inputs.BASE_PROJECT }}%0ACrave ProjectID: $PROJECTID %0ABuild for ${{ github.event.inputs.DEVICE_NAME }} has been queued %0ACheck Progress at: %0Ahttps://github.com/$(echo "${{ github.repository }}" | sed 's@_@\\_@g')/actions/runs/${{ github.run_id }}"
+        command -v jq || sudo apt-get install -y -q jq
+        case "${{ github.event.inputs.BUILD_TYPE }}" in
+          "user")      TYPE_LABEL="release"      ;;
+          "userdebug") TYPE_LABEL="userdebug"    ;;
+          "eng")       TYPE_LABEL="engineering"  ;;
+          *)           TYPE_LABEL="${{ github.event.inputs.BUILD_TYPE }}" ;;
+        esac
+
+        MESSAGE=$(printf '%s\n' \
+          "🔄 <b>Build Queued</b> for" \
+          "<b>${{ github.event.inputs.BASE_PROJECT }}</b> on <b>${{ github.event.inputs.DEVICE_NAME }}</b>" \
+          "<b>User:</b> ${{ github.actor }}" \
+          "<b>Started:</b> ${BUILD_START_FORMATTED}" \
+          "🔧 <b>Configuration:</b>" \
+          " • <b>Variant:</b> ${{ github.event.inputs.BUILD_TYPE }}" \
+          " • <b>Type:</b> ${TYPE_LABEL}" \
+          " • <b>Device:</b> ${{ github.event.inputs.DEVICE_NAME }}" \
+          " • <b>Product:</b> ${{ github.event.inputs.PRODUCT_NAME }}" \
+          " • <b>Build Command:</b> ${{ github.event.inputs.BUILD_COMMAND }}" \
+          " • <b>Clean Build:</b> ${{ github.event.inputs.CLEAN_BUILD }}" \
+          "📋 <b>Crave Project ID:</b> ${PROJECTID}")
+
+        curl -s -X POST "https://api.telegram.org/bot${botToken}/sendMessage" \
+          -H "Content-Type: application/json" \
+          -d "$(jq -n \
+            --arg chat_id "${chatId}" \
+            --arg text "${MESSAGE}" \
+            --arg run_url "https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
+            '{
+              chat_id: $chat_id,
+              text: $text,
+              parse_mode: "HTML",
+              reply_markup: {
+                inline_keyboard: [[
+                  { text: "⚙️ View Run", url: $run_url }
+                ]]
+              }
+            }')"
       env:
         chatId: ${{ secrets.TELEGRAM_TO }}
         botToken: ${{ secrets.TELEGRAM_TOKEN }}
-        jobStatus: "Build Started"
-        skipSuccess: false
 
     - name: Cleanup
       run: rm -rf * # This cleans github actions workspace
@@ -412,7 +444,7 @@ jobs:
           echo "Symlinking devspace folder"
           mkdir -p devspace
           sudo mkdir -p /crave-devspaces
-          sudo ln -sf ${pwd}/devspace /crave-devspaces
+          sudo ln -sf $(pwd)/devspace /crave-devspaces
           sudo chmod 777 /crave-devspaces
         else
           echo "We are already running in devspace... Skipping Symlinks"
@@ -542,49 +574,65 @@ jobs:
         ${{ github.event.inputs.BUILD_COMMAND }}"
       timeout-minutes: 1440
 
-      # Send Build 'status' notification (Success)
-    - name: Telegram Notification
-      if:  ${{ success() }}
-      continue-on-error: true
-      run: |
-        send_telegram_message() {
-          local message="$1"
-          curl -s -X POST \
-          https://api.telegram.org/bot$botToken/sendMessage \
-          -d chat_id=$chatId \
-          -d text="$message" \
-          -d parse_mode="Markdown"
-        }
-
-        send_telegram_message "Crave Project: ${{ github.event.inputs.BASE_PROJECT }}%0ACrave ProjectID: $PROJECTID %0ABuild for ${{ github.event.inputs.DEVICE_NAME }} has Succeeded! %0ACheck Progress at: %0Ahttps://github.com/$(echo "${{ github.repository }}" | sed 's@_@\\_@g')/actions/runs/${{ github.run_id }}%0ADownload at: https://github.com/$(echo "${{ github.repository }}" | sed 's@_@\\_@g')/releases/tag/${{ github.run_id }}"
-
-      env:
-        chatId: ${{ secrets.TELEGRAM_TO }}
-        botToken: ${{ secrets.TELEGRAM_TOKEN }}
-        jobStatus: ${{ job.status }}
-        skipSuccess: false
-
       # Send Build 'status' notification (Fail/Cancel)
     - name: Telegram Notification
-      if:  ${{ cancelled() || failure() }}
+      if: ${{ cancelled() || failure() }}
       continue-on-error: true
       run: |
-        send_telegram_message() {
-          local message="$1"
-          curl -s -X POST \
-          https://api.telegram.org/bot$botToken/sendMessage \
-          -d chat_id=$chatId \
-          -d text="$message" \
-          -d parse_mode="Markdown"
-        }
+        command -v jq || sudo apt-get install -y -q jq
+        BUILD_START_EPOCH=${BUILD_START_EPOCH:-$(date +%s)}
+        BUILD_START_FORMATTED=${BUILD_START_FORMATTED:-$(date -u '+%Y-%m-%d %H:%M:%S UTC')}
+        BUILD_END_EPOCH=$(date +%s)
+        DURATION=$(( BUILD_END_EPOCH - BUILD_START_EPOCH ))
+        DURATION_MIN=$(( DURATION / 60 ))
+        DURATION_SEC=$(( DURATION % 60 ))
 
-        if [ "$jobStatus" = "cancelled" ]; then
-          jobMessage="has been Cancelled!"
-        elif [ "$jobStatus" = "failure" ]; then
-          jobMessage="has Failed!"
+        case "${{ github.event.inputs.BUILD_TYPE }}" in
+          "user")      TYPE_LABEL="release"      ;;
+          "userdebug") TYPE_LABEL="userdebug"    ;;
+          "eng")       TYPE_LABEL="engineering"  ;;
+          *)           TYPE_LABEL="${{ github.event.inputs.BUILD_TYPE }}" ;;
+        esac
+
+        if [ "${jobStatus}" = "cancelled" ]; then
+          STATUS_ICON="🚫"
+          STATUS_TEXT="Build Cancelled"
+        else
+          STATUS_ICON="❌"
+          STATUS_TEXT="Build Failed"
         fi
 
-        send_telegram_message "Crave Project: ${{ github.event.inputs.BASE_PROJECT }}%0ACrave ProjectID: $PROJECTID %0ABuild for ${{ github.event.inputs.DEVICE_NAME }} $jobMessage %0ACheck Progress at: %0Ahttps://github.com/$(echo "${{ github.repository }}" | sed 's@_@\\_@g')/actions/runs/${{ github.run_id }}"
+        MESSAGE=$(printf '%s\n' \
+          "${STATUS_ICON} <b>${STATUS_TEXT}</b> for" \
+          "<b>${{ github.event.inputs.BASE_PROJECT }}</b> on <b>${{ github.event.inputs.DEVICE_NAME }}</b>" \
+          "<b>User:</b> ${{ github.actor }}" \
+          "<b>Started:</b> ${BUILD_START_FORMATTED}" \
+          "<b>Duration:</b> ${DURATION_MIN} minutes, ${DURATION_SEC} seconds" \
+          "📊 <b>Crave Project ID:</b> ${PROJECTID}" \
+          "🔧 <b>Configuration:</b>" \
+          " • <b>Variant:</b> ${{ github.event.inputs.BUILD_TYPE }}" \
+          " • <b>Type:</b> ${TYPE_LABEL}" \
+          " • <b>Device:</b> ${{ github.event.inputs.DEVICE_NAME }}" \
+          " • <b>Product:</b> ${{ github.event.inputs.PRODUCT_NAME }}" \
+          " • <b>Build Command:</b> ${{ github.event.inputs.BUILD_COMMAND }}" \
+          " • <b>Clean Build:</b> ${{ github.event.inputs.CLEAN_BUILD }}")
+
+        curl -s -X POST "https://api.telegram.org/bot${botToken}/sendMessage" \
+          -H "Content-Type: application/json" \
+          -d "$(jq -n \
+            --arg chat_id "${chatId}" \
+            --arg text "${MESSAGE}" \
+            --arg run_url "https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
+            '{
+              chat_id: $chat_id,
+              text: $text,
+              parse_mode: "HTML",
+              reply_markup: {
+                inline_keyboard: [[
+                  { text: "⚙️ View Run", url: $run_url }
+                ]]
+              }
+            }')"
         # Todo: error.log link
       env:
         chatId: ${{ secrets.TELEGRAM_TO }}
@@ -625,6 +673,65 @@ jobs:
         crave ssh -- "export TG_UPLOAD_LIMIT="${{ secrets.TG_UPLOAD_LIMIT }}"; bash /opt/crave/telegram/upload.sh '${{ github.event.inputs.DEVICE_NAME }}' '${{ secrets.EXTRA_FILES }}'"
       continue-on-error: true
 
+      # Send Build 'status' notification (Success) — fires after both uploads are done
+    - name: Telegram Notification
+      if: ${{ success() }}
+      continue-on-error: true
+      run: |
+        command -v jq || sudo apt-get install -y -q jq
+        BUILD_START_EPOCH=${BUILD_START_EPOCH:-$(date +%s)}
+        BUILD_START_FORMATTED=${BUILD_START_FORMATTED:-$(date -u '+%Y-%m-%d %H:%M:%S UTC')}
+        BUILD_END_EPOCH=$(date +%s)
+        DURATION=$(( BUILD_END_EPOCH - BUILD_START_EPOCH ))
+        DURATION_MIN=$(( DURATION / 60 ))
+        DURATION_SEC=$(( DURATION % 60 ))
+
+        case "${{ github.event.inputs.BUILD_TYPE }}" in
+          "user")      TYPE_LABEL="release"      ;;
+          "userdebug") TYPE_LABEL="userdebug"    ;;
+          "eng")       TYPE_LABEL="engineering"  ;;
+          *)           TYPE_LABEL="${{ github.event.inputs.BUILD_TYPE }}" ;;
+        esac
+
+        MESSAGE=$(printf '%s\n' \
+          "✅ <b>Build Completed</b> for" \
+          "<b>${{ github.event.inputs.BASE_PROJECT }}</b> on <b>${{ github.event.inputs.DEVICE_NAME }}</b>" \
+          "<b>User:</b> ${{ github.actor }}" \
+          "<b>Started:</b> ${BUILD_START_FORMATTED}" \
+          "<b>Duration:</b> ${DURATION_MIN} minutes, ${DURATION_SEC} seconds" \
+          "📊 <b>Crave Project ID:</b> ${PROJECTID}" \
+          "🔧 <b>Configuration:</b>" \
+          " • <b>Variant:</b> ${{ github.event.inputs.BUILD_TYPE }}" \
+          " • <b>Type:</b> ${TYPE_LABEL}" \
+          " • <b>Device:</b> ${{ github.event.inputs.DEVICE_NAME }}" \
+          " • <b>Product:</b> ${{ github.event.inputs.PRODUCT_NAME }}" \
+          " • <b>Build Command:</b> ${{ github.event.inputs.BUILD_COMMAND }}" \
+          " • <b>Clean Build:</b> ${{ github.event.inputs.CLEAN_BUILD }}" \
+          "🎉 <b>Build Artifact(s) Uploaded!</b>")
+
+        curl -s -X POST "https://api.telegram.org/bot${botToken}/sendMessage" \
+          -H "Content-Type: application/json" \
+          -d "$(jq -n \
+            --arg chat_id "${chatId}" \
+            --arg text "${MESSAGE}" \
+            --arg run_url "https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
+            --arg dl_url "https://github.com/${{ github.repository }}/releases/tag/${{ github.run_id }}" \
+            '{
+              chat_id: $chat_id,
+              text: $text,
+              parse_mode: "HTML",
+              reply_markup: {
+                inline_keyboard: [[
+                  { text: "⚙️ View Run", url: $run_url },
+                  { text: "📥 Download", url: $dl_url }
+                ]]
+              }
+            }')"
+      env:
+        chatId: ${{ secrets.TELEGRAM_TO }}
+        botToken: ${{ secrets.TELEGRAM_TOKEN }}
+        jobStatus: ${{ job.status }}
+
       # Remove 'crave' clone
     - name: Destroy Crave Clone
       if: ${{ always() }}
@@ -633,4 +740,4 @@ jobs:
           crave clone destroy -y $PROJECTFOLDER || echo "Error removing $PROJECTFOLDER"
         else          
           echo "Skipping removal"
-        fi
+      fi

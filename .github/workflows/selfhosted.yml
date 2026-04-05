@@ -493,8 +493,8 @@ jobs:
           envsubst < ${PWD}/crave.conf.sample >> ${PWD}/crave.conf
           rm -rf ${PWD}/crave.conf.sample       
           cp crave.conf $PROJECTFOLDER 
-        fi
-        if [[ -z "${{ secrets.CUSTOM_YAML }}" ]]; then
+        fi 
+         if [[ -z "${{ secrets.CUSTOM_YAML }}" ]]; then
           cp configs/crave/crave.yaml.aosp $PROJECTFOLDER/.repo/manifests/crave.yaml
           echo "No Custom Configuration Found, Using Template!"
         else
@@ -740,4 +740,4 @@ jobs:
           crave clone destroy -y $PROJECTFOLDER || echo "Error removing $PROJECTFOLDER"
         else          
           echo "Skipping removal"
-      fi
+        fi
